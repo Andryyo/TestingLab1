@@ -2,31 +2,135 @@
 package main
 
 import (
+	"log"
 	"fmt"
 	"math/rand"
+	"time"
 )
 
 type System struct {
 	components map[string]Component
-	function Conditioner
+	function AndCondition
 }
 
-func (s *System) generateFailVector(requiredErrorsCount int) FailVector {
+func (s *System) NewFailVector() FailVector {
 	result := FailVector{}
+	result.failed = make(map[string]bool)
+	result.probability = 1
+	for key := range s.components {
+		result.failed[key] = false
+		result.probability *= 1 - s.components[key].failProbability
+	}
+	return result
+}
+
+func (s *System) corrupt(failVector FailVector) {
+	for key, val := range failVector.failed {
+		component := s.components[key]
+		component.working = !val
+		s.components[key] = component
+	}
+}
+
+func (s *System) repair() {
+	for _, component := range s.components {
+		component.working = true
+	}
+}
+
+func (s *System) calcFailProbability(errorsCount int) {
+	coverage := 100
+	switch errorsCount {
+		case 0, 1, 2: coverage = 100
+		case 3: coverage = 50
+		case 4: coverage = 25
+		default: coverage = 100
+	}
+	failVectors := s.generateRandomFailVectors(errorsCount, coverage)
+	var result float64 = 0
+	failsCount := 0
+	totalCount := 0
+	for _, failVector := range failVectors {
+		s.corrupt(failVector)
+		resultString := fmt.Sprintf("%v: ", failVector)
+		for _, function := range s.function.conditions {
+			resultString += fmt.Sprintf("%v, ", function.check(s.components))
+		}
+		//log.Println(resultString)
+		if !s.function.check(s.components) {
+			result += failVector.probability
+			failsCount ++
+		}
+		totalCount ++
+		s.repair()
+	} 
+	result = result * float64(coverage) / 100
+	log.Printf("Fail probability at %v errors: %v, %v\\%v\n", errorsCount, result, failsCount, totalCount)
+}
+
+func (s *System) generateRandomFailVectors(requiredErrorsCount int, coveragePercentage int) []FailVector {
+	//if coveragePercentage == 100 {
+	//	return s.generateAllFailVectors(requiredErrorsCount)
+	//}
+	componentsCount := len(s.components)
+	resultsCount := 1
+	for i := 0; i<requiredErrorsCount; i++ {
+		resultsCount *= componentsCount - i
+	}
+	for i := 1; i<=requiredErrorsCount; i++ {
+		resultsCount /= i
+	}
+	resultsCount = resultsCount * coveragePercentage / 100
+	results := make([]FailVector, 0, resultsCount)
 	keys := make([]string, 0, len(s.components))
 	for key := range s.components {
 		keys = append(keys, key)
-		result.failed[key] = false
 	}
-	errorsCount := 0;
-	for errorsCount < requiredErrorsCount {
-		index := rand.Intn(len(keys))
-		if !result.failed[keys[index]] {
-			result.failed[keys[index]] = false
-			errorsCount++
+	for len(results) < resultsCount {
+		failVector := s.NewFailVector()
+		errorsKeys := make([]string, 0, requiredErrorsCount)
+		for len(errorsKeys) < requiredErrorsCount {
+			key := keys[rand.Intn(componentsCount)]
+			for _, errorKey := range errorsKeys {
+				if errorKey == key {
+					continue
+				}
+			}
+			errorsKeys = append(errorsKeys, key)
+		}
+		for _, errorKey := range errorsKeys {
+			failVector.failed[errorKey] = true
+			failVector.probability /= 1-s.components[errorKey].failProbability
+			failVector.probability *= s.components[errorKey].failProbability
+		}
+		results = append(results, failVector)
+	}
+	return results
+}
+
+// !! Function not working
+func (s *System) generateAllFailVectors(requiredErrorsCount int) []FailVector {
+	if requiredErrorsCount == 0 {
+		return []FailVector{s.NewFailVector()}
+	}
+	results := make([]FailVector, 0)
+	tmp := s.generateAllFailVectors(requiredErrorsCount - 1)
+	for key := range s.components {
+		for _, failVector := range tmp {
+			if failVector.failed[key] == false {
+				result := s.NewFailVector()
+				for k := range s.components {
+					result.failed[k] = failVector.failed[k]
+				}
+				result.probability = failVector.probability
+				result.failed[key] = true
+				result.probability /= 1-s.components[key].failProbability
+				result.probability *= s.components[key].failProbability
+				results = append(results, result)
+			}
 		}
 	}
-	return result
+	return results
 }
 
 type Component struct {
@@ -43,6 +147,18 @@ type Processor struct {
 
 type FailVector struct {
 	failed map[string]bool
+	probability float64
+}
+
+func (f FailVector) String() string {
+	result := ""
+	for key, value := range f.failed {
+		if value {
+			result += fmt.Sprintf("%v failed, ", key) 
+		}
+	}
+	result += fmt.Sprintf("%v", f.probability)
+	return result
 }
 
 type Conditioner interface {
@@ -74,7 +190,7 @@ func (c AndCondition) check(components map[string]Component) bool {
 	return true
 }
 
-func NewAndCondition(conditions ...Conditioner) Conditioner {
+func NewAndCondition(conditions ...Conditioner) AndCondition {
 	result := AndCondition{}
 	for _, condition := range conditions {
 		result.conditions = append(result.conditions, condition)
@@ -141,17 +257,48 @@ func NewSystem() *System {
 			NewCondition("A1"),
 			NewOrCondition(NewCondition("M1"),NewCondition("M2")),
 			NewCondition("A2"),
-			NewOrCondition(NewCondition("B4"),NewCondition("B5")),
+			NewCondition("B4"),
 			NewOrCondition(NewCondition("C5"),NewCondition("C6")),
 			NewCondition("D8"),
 			),
-		NewAndCondition(),
-		NewAndCondition(),
-		NewAndCondition(),
+		NewAndCondition(
+			NewCondition("Pr3"),
+			NewOrCondition(NewCondition("B1"),NewCondition("B2")),
+			NewCondition("A1"),
+			NewCondition("M1"),
+			NewCondition("C4"),
+			NewCondition("D6"),
+			),
+		NewAndCondition(
+			NewCondition("Pr6"),
+			NewOrCondition(NewCondition("B4"),NewCondition("B5")),
+			NewCondition("A2"),
+			NewOrCondition(NewCondition("M1"),NewCondition("M2")),
+			NewCondition("A1"),
+			NewOrCondition(NewCondition("B1"),NewCondition("B2")),
+			NewCondition("C1"),
+			NewOrCondition(NewCondition("D1"),NewCondition("D2")),
+			),
+		NewAndCondition(
+			NewCondition("Pr5"),
+			NewCondition("B4"),
+			NewCondition("A2"),
+			NewOrCondition(NewCondition("M1"),NewCondition("M2")),
+			NewCondition("A1"),
+			NewOrCondition(NewCondition("B1"),NewCondition("B2")),
+			NewOrCondition(NewCondition("C1"),NewCondition("C2")),
+			NewCondition("D2"),
+			),
 	)
 	return result
 }
 
 func main() {
-	fmt.Println("Hello World!")
+	rand.Seed(time.Now().UTC().UnixNano())
+	s := NewSystem()
+	s.calcFailProbability(0)
+	s.calcFailProbability(1)
+	s.calcFailProbability(2)
+	s.calcFailProbability(3)
+	s.calcFailProbability(4)
 }
