@@ -2,15 +2,18 @@
 package main
 
 import (
-	"log"
+	//"log"
 	"fmt"
 	"math/rand"
 	"time"
+	"reflect"
+	"strings"
 )
 
 type System struct {
 	components map[string]Component
 	function AndCondition
+	redirectionTable map[*Processor]map[*Processor]int
 }
 
 func (s *System) NewFailVector() FailVector {
@@ -19,7 +22,7 @@ func (s *System) NewFailVector() FailVector {
 	result.probability = 1
 	for key := range s.components {
 		result.failed[key] = false
-		result.probability *= 1 - s.components[key].failProbability
+		result.probability *= 1 - s.components[key].GetFailProbability()
 	}
 	return result
 }
@@ -27,14 +30,41 @@ func (s *System) NewFailVector() FailVector {
 func (s *System) corrupt(failVector FailVector) {
 	for key, val := range failVector.failed {
 		component := s.components[key]
-		component.working = !val
+		component.SetWorking(!val)
 		s.components[key] = component
 	}
 }
 
 func (s *System) repair() {
 	for _, component := range s.components {
-		component.working = true
+		component.SetWorking(true)
+	}
+}
+
+func (s *System) redirect() {
+	for key := range s.components {
+		if proc, ok := s.components[key].(*Processor) ; ok && !s.components[key].Working() {
+			for donorKey := range s.redirectionTable[proc] {
+				if !s.components[donorKey.name].Working() {
+					continue
+				}
+				redirection := 0
+				if s.redirectionTable[proc][donorKey] >= s.components[key].(*Processor).load {
+					redirection = s.components[key].(*Processor).load
+				} else {
+					redirection = s.redirectionTable[proc][donorKey]
+				}
+				donor := s.components[donorKey.name].(*Processor)
+				if redirection > donor.maxLoad - donor.load {
+					redirection = donor.maxLoad - donor.load
+				}
+				s.components[donorKey.name].(*Processor).load += redirection
+				s.components[key].(*Processor).load -= redirection
+			}
+			if s.components[key].(*Processor).load == 0 {
+				s.components[key].(*Processor).successfullyRedirected = true
+			}
+		}
 	}
 }
 
@@ -50,8 +80,10 @@ func (s *System) calcFailProbability(errorsCount int) {
 	var result float64 = 0
 	failsCount := 0
 	totalCount := 0
+	componentsInFailedVectors := make(map[string]float64)
 	for _, failVector := range failVectors {
 		s.corrupt(failVector)
+		s.redirect()
 		resultString := fmt.Sprintf("%v: ", failVector)
 		for _, function := range s.function.conditions {
 			resultString += fmt.Sprintf("%v, ", function.check(s.components))
@@ -59,19 +91,36 @@ func (s *System) calcFailProbability(errorsCount int) {
 		//log.Println(resultString)
 		if !s.function.check(s.components) {
 			result += failVector.probability
+			for key, val := range failVector.failed {
+				if val {
+					componentsInFailedVectors[key]+= failVector.probability
+				}
+			}
 			failsCount ++
 		}
 		totalCount ++
 		s.repair()
+	}
+	for key, val := range componentsInFailedVectors {
+		fmt.Printf("%v: %.4v%%\n", key, val/result*100)
 	} 
 	result = result * float64(coverage) / 100
-	log.Printf("Fail probability at %v errors: %v, %v\\%v\n", errorsCount, result, failsCount, totalCount)
+	fmt.Printf("Fail probability at %v errors: %v, %v\n", errorsCount, result, float32(failsCount)/float32(totalCount))
 }
 
 func (s *System) generateRandomFailVectors(requiredErrorsCount int, coveragePercentage int) []FailVector {
-	//if coveragePercentage == 100 {
-	//	return s.generateAllFailVectors(requiredErrorsCount)
-	//}
+	if coveragePercentage == 100 {
+		vectors := s.generateAllFailVectors(requiredErrorsCount)
+		for i := 0; i < len(vectors); i++ {
+			for j := i + 1; j < len(vectors); j++ {
+				if reflect.DeepEqual(vectors[i].failed, vectors[j].failed) {
+					vectors = append(vectors[:j], vectors[j+1:]...)
+					j--;
+				}
+			}
+		}
+		return vectors
+	}
 	componentsCount := len(s.components)
 	resultsCount := 1
 	for i := 0; i<requiredErrorsCount; i++ {
@@ -100,15 +149,14 @@ func (s *System) generateRandomFailVectors(requiredErrorsCount int, coveragePerc
 		}
 		for _, errorKey := range errorsKeys {
 			failVector.failed[errorKey] = true
-			failVector.probability /= 1-s.components[errorKey].failProbability
-			failVector.probability *= s.components[errorKey].failProbability
+			failVector.probability /= 1-s.components[errorKey].GetFailProbability()
+			failVector.probability *= s.components[errorKey].GetFailProbability()
 		}
 		results = append(results, failVector)
 	}
 	return results
 }
 
-// !! Function not working
 func (s *System) generateAllFailVectors(requiredErrorsCount int) []FailVector {
 	if requiredErrorsCount == 0 {
 		return []FailVector{s.NewFailVector()}
@@ -124,8 +172,8 @@ func (s *System) generateAllFailVectors(requiredErrorsCount int) []FailVector {
 				}
 				result.probability = failVector.probability
 				result.failed[key] = true
-				result.probability /= 1-s.components[key].failProbability
-				result.probability *= s.components[key].failProbability
+				result.probability /= 1-s.components[key].GetFailProbability()
+				result.probability *= s.components[key].GetFailProbability()
 				results = append(results, result)
 			}
 		}
@@ -133,16 +181,65 @@ func (s *System) generateAllFailVectors(requiredErrorsCount int) []FailVector {
 	return results
 }
 
-type Component struct {
+type CommonComponent struct {
 	name string
 	failProbability float64
 	working bool
 }
 
+func (p *CommonComponent) GetName() string {
+	return p.name
+}
+
+func (p *CommonComponent) GetFailProbability() float64 {
+	return p.failProbability
+}
+
+
+func (p *CommonComponent) Working() bool {
+	return p.working
+}
+
+
+func (p *CommonComponent) SetWorking(val bool) {
+	p.working = val
+}
+
 type Processor struct {
-	Component
+	CommonComponent
 	load int
 	maxLoad int
+	successfullyRedirected bool
+}
+
+func (p *Processor) GetName() string {
+	return p.name
+}
+
+func (p *Processor) GetFailProbability() float64 {
+	return p.failProbability
+}
+
+
+func (p *Processor) Working() bool {
+	return (p.working || p.successfullyRedirected) && p.load <= p.maxLoad 
+}
+
+
+func (p *Processor) SetWorking(val bool) {
+	p.working = val
+	if val {
+		p.load = 100
+	}
+	p.successfullyRedirected = false
+}
+
+
+type Component interface {
+	GetName() string
+	GetFailProbability() float64
+	Working() bool
+	SetWorking(val bool)
 }
 
 type FailVector struct {
@@ -174,7 +271,7 @@ func NewCondition(name string) Conditioner {
 }
 
 func (c Condition) check(components map[string]Component) bool {
-	return components[c.name].working
+	return components[c.name].Working()
 }
 
 type AndCondition struct {
@@ -220,7 +317,12 @@ func NewOrCondition(conditions ...Conditioner) Conditioner {
 }
 
 func NewComponent(name string, failProbability float64) Component {
-	return Component{name, failProbability, true}
+	basicComponent := CommonComponent{name, failProbability, true}
+	if strings.HasPrefix(name, "Pr") {
+		return &Processor{basicComponent, 100, 200, false}
+	} else {
+		return &basicComponent
+	}
 }
 
 func NewSystem() *System {
@@ -244,11 +346,38 @@ func NewSystem() *System {
 		"C6" : NewComponent("C6", 4.1*0.0001),
 		"D1" : NewComponent("D1", 2.2*0.00001),
 		"D2" : NewComponent("D2", 2.2*0.00001),
-		"D4" : NewComponent("D4", 2.2*0.00001),
+		"D3" : NewComponent("D3", 2.2*0.00001),
 		"D6" : NewComponent("D6", 2.2*0.00001),
 		"D8" : NewComponent("D8", 2.2*0.00001),
 		"M1" : NewComponent("M1", 3.6*0.0001),
 		"M2" : NewComponent("M2", 3.6*0.0001),
+	}
+	result.redirectionTable = map[*Processor]map[*Processor]int {
+		result.components["Pr1"].(*Processor) : map[*Processor]int {
+			result.components["Pr2"].(*Processor) : 100,
+			result.components["Pr3"].(*Processor) : 100,
+			result.components["Pr5"].(*Processor) : 100,
+			result.components["Pr6"].(*Processor) : 100},
+		result.components["Pr2"].(*Processor) : map[*Processor]int {
+			result.components["Pr1"].(*Processor) : 100,
+			result.components["Pr3"].(*Processor) : 100,
+			result.components["Pr5"].(*Processor) : 100,
+			result.components["Pr6"].(*Processor) : 100},	
+		result.components["Pr3"].(*Processor) : map[*Processor]int {
+			result.components["Pr2"].(*Processor) : 100,
+			result.components["Pr1"].(*Processor) : 100,
+			result.components["Pr5"].(*Processor) : 100,
+			result.components["Pr6"].(*Processor) : 100},
+		result.components["Pr5"].(*Processor) : map[*Processor]int {
+			result.components["Pr2"].(*Processor) : 100,
+			result.components["Pr3"].(*Processor) : 100,
+			result.components["Pr1"].(*Processor) : 100,
+			result.components["Pr6"].(*Processor) : 100},
+		result.components["Pr6"].(*Processor) : map[*Processor]int {
+			result.components["Pr2"].(*Processor) : 100,
+			result.components["Pr3"].(*Processor) : 100,
+			result.components["Pr5"].(*Processor) : 100,
+			result.components["Pr1"].(*Processor) : 100},
 	}
 	result.function = NewAndCondition(
 		NewAndCondition(
@@ -287,7 +416,7 @@ func NewSystem() *System {
 			NewCondition("A1"),
 			NewOrCondition(NewCondition("B1"),NewCondition("B2")),
 			NewOrCondition(NewCondition("C1"),NewCondition("C2")),
-			NewCondition("D2"),
+			NewCondition("D3"),
 			),
 	)
 	return result
@@ -296,7 +425,6 @@ func NewSystem() *System {
 func main() {
 	rand.Seed(time.Now().UTC().UnixNano())
 	s := NewSystem()
-	s.calcFailProbability(0)
 	s.calcFailProbability(1)
 	s.calcFailProbability(2)
 	s.calcFailProbability(3)
